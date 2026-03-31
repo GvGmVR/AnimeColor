@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.pt
+*.bin
+*.ckpt
 
 # large model weights (optional if not versioning)
 pretrained_weights/
