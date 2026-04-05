@@ -378,7 +378,7 @@ def run_animecolor(config: dict):
     # ============================================================
     print(f"[PHASE 3] Single-pass inference  ({padded_frames} frames, "
         f"{INFERENCE_STEPS} steps)...")
-    print("  This is the longest phase — ~15-30 min on RTX 4070 for 49 frames.")
+    print("  This is the longest phase — ~15-30 min for 49 frames.")
 
     pipe.dclip_model.to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(SEED)

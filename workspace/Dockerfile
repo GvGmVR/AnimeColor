@@ -2,27 +2,41 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 WORKDIR /workspace
 
-# System deps
+# =========================
+# SYSTEM SETUP
+# =========================
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip git ffmpeg \
+    python3 python3-pip python3-dev git ffmpeg \
+    && ln -s /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Python setup
-RUN pip3 install --upgrade pip
+# Upgrade pip
+RUN python -m pip install --upgrade pip
 
-# Install torch WITH CUDA (IMPORTANT)
-RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# =========================
+# INSTALL PYTHON DEPENDENCIES
+# =========================
 
-# Copy project
+# Copy requirements first (for caching)
+COPY AnimeColor_Code/requirements.txt /workspace/requirements.txt
+
+# Install everything in ONE layer (important)
+RUN pip install --no-cache-dir \
+    torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121 && \
+    pip install --no-cache-dir -r /workspace/requirements.txt && \
+    pip install --no-cache-dir runpod
+
+# =========================
+# COPY PROJECT
+# =========================
 COPY . /workspace
 
-# Install remaining dependencies
-RUN pip install -r requirements.txt
-
-# RunPod SDK
-RUN pip install runpod
-
-# Make start script executable
+# =========================
+# FINAL SETUP
+# =========================
 RUN chmod +x start.sh
+
+ENV PYTHONUNBUFFERED=1
 
 CMD ["./start.sh"]
