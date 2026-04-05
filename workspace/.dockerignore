@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+
+inputs/
+outputs/
+
+pretrained_weights/
+*.pt
+*.bin
+*.safetensors
+
+.git/

@@ -8,6 +8,8 @@ __pycache__/
 *.bin
 *.ckpt
 
+inputs/
+
 # large model weights (optional if not versioning)
 pretrained_weights/
 

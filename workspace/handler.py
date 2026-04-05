@@ -4,9 +4,23 @@ import uuid
 import shutil
 from run_animecolor import run_animecolor
 
+def normalize_path(path):
+    if os.name != "nt":
+        path = path.replace("\\", "/")
+
+        if "/workspace/" in path:
+            return path  # already correct
+
+        if "/inputs/" in path:
+            return "/workspace/inputs/" + path.split("/inputs/")[-1]
+
+    return path
+
 def handler(job):
     try:
         job_input = job["input"]
+        
+        print("JOB INPUT:", job_input)
 
         # =============================
         # 1. CREATE JOB FOLDERS
@@ -31,7 +45,10 @@ def handler(job):
         #   "ref_image": file path
         # }
 
-        ref_image_path = job_input["ref_image"]
+        ref_image_path = normalize_path(job_input["ref_image"])
+
+        if not os.path.exists(ref_image_path):
+            raise FileNotFoundError(f"Ref image not found: {ref_image_path}")
 
         # =============================
         # SUPPORT BOTH MODES
@@ -39,17 +56,23 @@ def handler(job):
 
         if "lineart_frames" in job_input:
             # Mode 1: explicit file list
-            lineart_paths = job_input["lineart_frames"]
+            lineart_paths =[normalize_path(p) for p in job_input["lineart_frames"]]
 
         elif "lineart_dir" in job_input:
-            # Mode 2: folder input (NEW — recommended)
-            src_dir = job_input["lineart_dir"]
+            src_dir = normalize_path(job_input["lineart_dir"])
+
+            print(f"[DEBUG] Using lineart_dir: {src_dir}")
+
+            if not os.path.exists(src_dir):
+                raise FileNotFoundError(f"Lineart dir not found: {src_dir}")
 
             lineart_paths = sorted([
                 os.path.join(src_dir, f)
                 for f in os.listdir(src_dir)
                 if f.lower().endswith((".png", ".jpg", ".jpeg"))
             ])
+            if len(lineart_paths) == 0:
+                raise ValueError(f"No images found in {src_dir}")
         else:
             raise ValueError("Provide either 'lineart_frames' or 'lineart_dir'")
 
@@ -61,6 +84,9 @@ def handler(job):
         # Copy reference image
         ref_dst = os.path.join(input_dir, "ref.png")
         shutil.copy(ref_image_path, ref_dst)
+        
+        print("FILES FOUND:", len(lineart_paths))
+        print("FIRST 3 FILES:", lineart_paths[:3])
 
         # =============================
         # 3. BUILD CONFIG FOR MODEL
