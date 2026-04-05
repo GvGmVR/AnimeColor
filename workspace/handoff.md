@@ -451,5 +451,3 @@ Check:
 * Docker mount correctness
 
 ---
-
-**This system is now production-ready from AI side.**
