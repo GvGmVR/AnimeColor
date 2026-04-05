@@ -1,0 +1,8 @@
+{
+  "input": {
+    "lineart_dir": "D:/Ixnel/dev/AnimeColor/workspace/inputs/lineart",
+    "ref_image": "D:/Ixnel/dev/AnimeColor/workspace/inputs/ref.png",
+    "start_frame": 0,
+    "num_frames": 49
+  }
+}
