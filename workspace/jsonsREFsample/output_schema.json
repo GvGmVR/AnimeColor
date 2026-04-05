@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "required": ["status"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "error"]
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Unique job identifier"
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "output_video": {
+          "type": "string",
+          "description": "Path to generated video file"
+        },
+        "frames": {
+          "type": "integer",
+          "description": "Number of frames processed"
+        },
+        "duration": {
+          "type": "number",
+          "description": "Duration of output video in seconds"
+        }
+      }
+    },
+    "message": {
+      "type": "string",
+      "description": "Error message if status = error"
+    }
+  }
+}

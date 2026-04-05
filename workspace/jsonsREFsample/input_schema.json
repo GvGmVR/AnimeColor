@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": ["lineart_dir", "ref_image"],
+  "properties": {
+    "lineart_dir": {
+      "type": "string",
+      "description": "Path to directory containing lineart frames (.png)"
+    },
+    "ref_image": {
+      "type": "string",
+      "description": "Path to reference image for color/style guidance"
+    },
+    "start_frame": {
+      "type": "integer",
+      "default": 0,
+      "description": "Starting frame index"
+    },
+    "num_frames": {
+      "type": "integer",
+      "default": 0,
+      "description": "Number of frames to process (0 = all)"
+    }
+  }
+}
