@@ -29,9 +29,20 @@ def run_animecolor(config: dict):
     START_FRAME   : first frame index to read from LINEART_DIR
     NUM_FRAMES    : keep at 49 for best quality (model's native window)
     OUTPUT_FPS    : 24 = standard anime; 12 = slower motion feel
-    GUIDANCE_SCALE: 7.5 default; raise to 8–9 for stronger ref adherence
+    GUIDANCE_SCALE: 6.0 matches reference script default
     INFER_REST    : GPU cooldown after inference (seconds)
     DECODE_REST   : GPU cooldown after decode (seconds)
+
+    CHANGE LOG
+    ----------
+    v3 — RADIO decoupled from pipeline object entirely.
+         RADIO forward pass now runs standalone BEFORE pipe is constructed,
+         so enable_sequential_cpu_offload never installs hooks on dclip_model.
+         id_cond / id_vit_hidden are plain CPU tensors passed into pipe().
+         Scheduler changed from CogVideoXDDIMScheduler → DDIMScheduler
+         to match reference script (test_msketch.py).
+         Inference steps raised from 25 → 50 to match reference script.
+         Guidance scale default changed from 7.5 → 6.0 to match reference.
     """
 
     import os, sys, gc, torch, imageio, warnings, time, re
@@ -40,20 +51,6 @@ def run_animecolor(config: dict):
     from pathlib import Path
     from accelerate.hooks import remove_hook_from_module
     import importlib.util
-
-    from PIL import ImageEnhance, ImageFilter
-
-    def post_process_frame(img: Image.Image) -> Image.Image:
-        # Order matters: brighten/saturate first, sharpen last
-        # (sharpening after colour boost enhances the right edges)
-        img = ImageEnhance.Brightness(img).enhance(1.25)
-        img = ImageEnhance.Color(img).enhance(1.70)
-        img = ImageEnhance.Contrast(img).enhance(1.30)
-        # Unsharp mask: recovers the crisp anime line quality lost in diffusion decode
-        # radius=1, percent=200, threshold=2 hits sharpness ~590 vs ref ~1537
-        # raise percent to 250 for even crisper lines (risk: halos on fine detail)
-        img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=200, threshold=2))
-        return img
 
     # ============================================================
     # 1. ENVIRONMENT
@@ -86,18 +83,23 @@ def run_animecolor(config: dict):
     # ============================================================
     # 3. SETTINGS (FROM CONFIG)
     # ============================================================
-    START_FRAME      = config.get("start_frame", 0) # Change to process a different 49-frame window
-    NUM_FRAMES       = config.get("num_frames", 49) # Native CogVideoX-2B context — do not exceed this
+    START_FRAME      = config.get("start_frame", 0)
+    NUM_FRAMES       = config.get("num_frames", 49)      # Native CogVideoX-2B context window
     WIDTH            = config.get("width", 512)
     HEIGHT           = config.get("height", 320)
-    OUTPUT_FPS       = config.get("output_fps", 24) # 24 = anime standard  |  12 = slower/smoother feel
-    GUIDANCE_SCALE   = config.get("guidance_scale", 7.5) # raise to 8-9 for stronger reference adherence
-    INFERENCE_STEPS  = config.get("inference_steps", 25) # 25 is the paper default; 30 for slightly better quality
-    INFER_REST       = config.get("infer_rest", 10) # seconds to rest GPU after inference
-    DECODE_REST      = config.get("decode_rest", 5) # seconds to rest GPU after decode
-    SEED             = config.get("seed", 42)
+    OUTPUT_FPS       = config.get("output_fps", 24)
+    # guidance_scale 6.0 matches the reference script (test_msketch.py).
+    # The model was trained and evaluated at this value.
+    # Raise to 7–8 only if colors are still weak after HCE is confirmed working.
+    GUIDANCE_SCALE   = config.get("guidance_scale", 6.0)
+    # 50 steps matches the reference script. 25 was too few — the denoising
+    # trajectory doesn't converge fully at 25 steps with DDIMScheduler.
+    INFERENCE_STEPS  = config.get("inference_steps", 50)
+    INFER_REST       = config.get("infer_rest", 10)
+    DECODE_REST      = config.get("decode_rest", 5)
+    SEED             = config.get("seed", 43)             # 43 matches reference script default
 
-    weight_dtype = torch.bfloat16   # RTX 4070 native bf16
+    weight_dtype = torch.bfloat16
 
     # ============================================================
     # 4. SELF-HEALING PATCHES
@@ -154,12 +156,6 @@ def run_animecolor(config: dict):
 
     # ============================================================
     # 5. SMART GPU DECODE  (bf16 → fp32 → CPU last resort)
-    #
-    #   After inference the transformer weights are back on CPU via
-    #   sequential offload.  The VAE is the only model needed for
-    #   decode, so it can have the full 12 GB VRAM to itself.
-    #   A single 49-frame decode in bf16 uses ~4-5 GB — well within
-    #   the RTX 4070's budget after inference models offload.
     # ============================================================
     def get_free_vram_gb() -> float:
         if not torch.cuda.is_available():
@@ -221,19 +217,13 @@ def run_animecolor(config: dict):
 
     # ============================================================
     # 6. SKETCH PRE-PROCESSING
-    #    Binarise lineart before passing it to the model.
-    #    The paper uses XDoG-extracted sketches which are clean
-    #    binary black-on-white.  Noisy or anti-aliased lines cause
-    #    the model to ghost at edge boundaries.
+    #    Input sketches are expected to already be Anime2Sketch or
+    #    XDoG quality (clean binary black-on-white). The clean_sketch
+    #    function applies a final binarization pass as a safety net
+    #    to catch any residual anti-aliasing from the extraction step.
     # ============================================================
     def clean_sketch(img: Image.Image, threshold: int = 128) -> Image.Image:
-        """
-        Convert sketch to clean binary black lines on white background.
-        Threshold 128 works for most XDoG/Anime2Sketch outputs.
-        Lower the threshold (e.g. 100) to keep finer lines.
-        """
         gray = img.convert("L")
-        # Binarise: pixels darker than threshold -> black (0), rest -> white (255)
         binary = gray.point(lambda x: 0 if x < threshold else 255)
         return binary.convert("RGB")
 
@@ -261,8 +251,6 @@ def run_animecolor(config: dict):
     selected_paths = all_frame_paths[START_FRAME:end_frame]
     actual_frames  = len(selected_paths)
 
-    # The model requires num_frames to be of the form 4k+1 (1,5,9,...,49)
-    # 49 = 4*12+1 ✓   If we have fewer, round down to nearest valid value
     def nearest_valid_frame_count(n: int) -> int:
         """CogVideoX requires frames = 4k+1. Find largest valid count <= n."""
         if n <= 0: return 1
@@ -270,20 +258,91 @@ def run_animecolor(config: dict):
         return 4 * k + 1
 
     padded_frames = nearest_valid_frame_count(actual_frames)
-    pad_needed    = padded_frames - actual_frames   # might be 0
+    pad_needed    = padded_frames - actual_frames
 
     print(f"\n[CONFIG] Processing frames {START_FRAME}–{end_frame-1} "
         f"({actual_frames} real + {pad_needed} pad = {padded_frames} total)")
     print(f"         Resolution: {WIDTH}×{HEIGHT}  |  FPS: {OUTPUT_FPS}  |  "
         f"Duration: {actual_frames/OUTPUT_FPS:.2f}s")
+    print(f"         Guidance: {GUIDANCE_SCALE}  |  Steps: {INFERENCE_STEPS}  |  Seed: {SEED}")
 
     # ============================================================
-    # 8. LOAD MODELS
+    # 8. RADIO FORWARD PASS — STANDALONE, BEFORE PIPELINE EXISTS
+    #
+    #    CRITICAL: RADIO must run here, before the pipeline is built
+    #    and before enable_sequential_cpu_offload is called.
+    #
+    #    The previous approach attached dclip_model to the pipe object
+    #    and called enable_sequential_cpu_offload afterwards. This caused
+    #    accelerate to install hooks on dclip_model, which intercepted
+    #    the .to("cuda") call and corrupted the forward pass device
+    #    routing. The symptom was correct scene structure but wrong/
+    #    desaturated colors — the HCE signal was not reaching the DiT.
+    #
+    #    The fix (matching test_msketch.py from the paper's repo):
+    #    - Load RADIO independently
+    #    - Run forward pass on reference image
+    #    - Store id_cond, id_vit_hidden as plain CPU tensors
+    #    - Delete RADIO model before pipeline is constructed
+    #    - Pass the plain tensors into pipe() — pipeline handles
+    #      device placement internally during the forward pass
     # ============================================================
-    print("\n[PHASE 1] Loading models into system RAM (bfloat16)...")
+    print("\n[PHASE 0] RADIO encoder — standalone HCE forward pass...")
 
-    from transformers import T5EncoderModel, T5Tokenizer, AutoModel, CLIPImageProcessor
-    from diffusers import CogVideoXDDIMScheduler
+    from transformers import AutoModel, CLIPImageProcessor
+
+    # Open reference image at inference resolution for RADIO
+    ref_pil_radio = Image.open(REF_IMAGE).convert("RGB").resize((WIDTH, HEIGHT))
+
+    # Load RADIO directly to CUDA — no pipeline hooks involved
+    dclip_model     = AutoModel.from_pretrained(
+        RADIO_DIR, trust_remote_code=True, torch_dtype=weight_dtype
+    ).to("cuda")
+    dclip_processor = CLIPImageProcessor.from_pretrained(RADIO_DIR, torch_dtype=weight_dtype)
+
+    # Preprocess with CLIPImageProcessor — this applies the correct
+    # ImageNet-style normalization that RADIO expects.
+    # Raw /255.0 normalization (used for ref_tensor → LCG path) is wrong here.
+    dclip_input = dclip_processor(
+        images=ref_pil_radio,
+        return_tensors="pt"
+    ).pixel_values.to("cuda", dtype=weight_dtype)
+
+    print(f"  RADIO input shape  : {dclip_input.shape}")
+
+    with torch.inference_mode():
+        id_cond, id_vit_hidden = dclip_model(dclip_input)
+
+    # Move HCE tokens to CPU immediately — they will be passed as plain
+    # tensors to pipe(). The pipeline's internal cross-attention will
+    # move them to the correct device during the forward pass.
+    id_cond      = id_cond.cpu()
+    id_vit_hidden = id_vit_hidden.cpu()
+
+    print(f"  id_cond shape      : {id_cond.shape}        device: {id_cond.device}")
+    print(f"  id_vit_hidden shape: {id_vit_hidden.shape}  device: {id_vit_hidden.device}")
+
+    # Free RADIO from VRAM entirely before pipeline is constructed.
+    # The pipeline must never see dclip_model — it should not be attached
+    # to pipe and should not be present when enable_sequential_cpu_offload runs.
+    del dclip_model, dclip_input, ref_pil_radio
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    free_after_radio = get_free_vram_gb()
+    print(f"  RADIO freed. Free VRAM: {free_after_radio:.2f} GB")
+    print("[PHASE 0] Done.\n")
+
+    # ============================================================
+    # 9. LOAD MODELS
+    # ============================================================
+    print("[PHASE 1] Loading models into system RAM (bfloat16)...")
+
+    from transformers import T5EncoderModel, T5Tokenizer
+    # DDIMScheduler (standard) matches the reference script (test_msketch.py).
+    # CogVideoXDDIMScheduler is the base model's scheduler — the AnimeColor
+    # checkpoint was evaluated using the standard DDIMScheduler.
+    from diffusers import DDIMScheduler
     from cogvideox.models.transformer3d_radio import CogVideoXTransformer3DModel
     from cogvideox.models.transformer3d import CogVideoXTransformer3DModel as Ref3D
     from cogvideox.models.autoencoder_magvit import AutoencoderKLCogVideoX
@@ -299,15 +358,18 @@ def run_animecolor(config: dict):
         CKPT_DIR, subfolder="transformer", torch_dtype=weight_dtype)
     reference_transformer = Ref3D.from_pretrained(
         CKPT_DIR, subfolder="referencenet", torch_dtype=weight_dtype)
-    dclip_model = AutoModel.from_pretrained(
-        RADIO_DIR, trust_remote_code=True, torch_dtype=weight_dtype)
-    dclip_processor = CLIPImageProcessor.from_pretrained(
-        RADIO_DIR, torch_dtype=weight_dtype)
-    scheduler = CogVideoXDDIMScheduler.from_pretrained(
-        BASE_DIR, subfolder="scheduler")
+
+    # Standard DDIMScheduler loaded from base model scheduler config.
+    # This replaces CogVideoXDDIMScheduler to match the reference script.
+    scheduler = DDIMScheduler.from_pretrained(
+        BASE_DIR, subfolder="scheduler"
+    )
 
     denoising_transformer.is_train_qformer = False
 
+    # IMPORTANT: dclip_model is NOT attached to pipe here.
+    # RADIO has already run in Phase 0. The pipeline never needs to
+    # call RADIO itself — id_cond and id_vit_hidden are pre-computed.
     pipe = CogVideoX_Fun_Pipeline_Control_Color(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
@@ -316,50 +378,51 @@ def run_animecolor(config: dict):
         reference_transformer=reference_transformer,
         scheduler=scheduler,
     )
-    pipe.dclip_model     = dclip_model
-    pipe.dclip_processor = dclip_processor
 
-    # enable_sequential_cpu_offload installs accelerate hooks on ALL models
-    # including the VAE.  These hooks are REQUIRED during inference because
-    # the pipeline calls vae.encode() internally for the control video.
-    # We remove them only AFTER inference is complete (Phase 4).
+    # enable_sequential_cpu_offload now only hooks the pipeline's own models:
+    # text_encoder, vae, denoising_transformer, reference_transformer.
+    # dclip_model is gone — no hook conflict possible.
     pipe.enable_sequential_cpu_offload()
     try:
         pipe.enable_attention_slicing(slice_size="max")
     except Exception:
         pass
+
+    # VAE slicing enabled unconditionally here because the pipeline's internal
+    # vae.encode() call (for control video) runs during inference under offload.
+    # We will re-evaluate and conditionally disable slicing for the decode phase.
     pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
+    # Tiling intentionally NOT enabled — introduces spatial seam artifacts.
 
     torch.cuda.empty_cache()
     gc.collect()
     print("[PHASE 1] Done.\n")
 
     # ============================================================
-    # 9. PREPARE TENSORS
+    # 10. PREPARE TENSORS
     # ============================================================
     print("[PHASE 2] Preparing input tensors...")
 
-    # Reference image
+    # Reference image for the LCG path (ref_image parameter).
+    # Raw /255.0 normalization is correct here — the pipeline's VAE encoder
+    # handles this path. This is separate from the RADIO/HCE path above.
     ref_pil    = Image.open(REF_IMAGE).convert("RGB").resize((WIDTH, HEIGHT))
     ref_np     = np.array(ref_pil)
     ref_tensor = (
         torch.from_numpy(ref_np).permute(2, 0, 1).to(weight_dtype) / 255.0
     ).unsqueeze(0)   # [1, C, H, W]
 
-    # Sketch frames — clean, resize, load
+    # Sketch frames
     sketch_frames = []
     for p in selected_paths:
         img = Image.open(p).convert("RGB").resize((WIDTH, HEIGHT))
-        img = clean_sketch(img)   # binarise for clean model input
+        img = clean_sketch(img)
         sketch_frames.append(np.array(img))
 
-    # Pad to nearest valid frame count (repeat last frame)
     if pad_needed > 0:
         print(f"  Padding {pad_needed} frame(s) to reach valid count {padded_frames}.")
         sketch_frames += [sketch_frames[-1]] * pad_needed
 
-    # Build control tensor: [1, C, F, H, W]
     ctrl_array  = np.array(sketch_frames)                   # [F, H, W, C]
     ctrl_tensor = (
         torch.from_numpy(ctrl_array)
@@ -367,20 +430,19 @@ def run_animecolor(config: dict):
         .to(weight_dtype) / 255.0
     ).unsqueeze(0)                                          # [1, C, F, H, W]
 
-    print(f"  ref_tensor  : {ref_tensor.shape}")
-    print(f"  ctrl_tensor : {ctrl_tensor.shape}   (frames={padded_frames})")
+    print(f"  ref_tensor    : {ref_tensor.shape}")
+    print(f"  ctrl_tensor   : {ctrl_tensor.shape}  (frames={padded_frames})")
+    print(f"  id_cond       : {id_cond.shape}  (pre-computed, HCE active)")
+    print(f"  id_vit_hidden : {id_vit_hidden.shape}")
     print("[PHASE 2] Done.\n")
 
     # ============================================================
-    # 10. SINGLE-PASS INFERENCE
-    #     All padded_frames processed together — the 3D attention
-    #     across the full sequence is what gives temporal consistency.
+    # 11. SINGLE-PASS INFERENCE
     # ============================================================
     print(f"[PHASE 3] Single-pass inference  ({padded_frames} frames, "
-        f"{INFERENCE_STEPS} steps)...")
-    print("  This is the longest phase — ~15-30 min for 49 frames.")
+        f"{INFERENCE_STEPS} steps, guidance={GUIDANCE_SCALE})...")
+    print("  This is the longest phase — ~30-60 min for 49 frames at 50 steps on 8GB.")
 
-    pipe.dclip_model.to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(SEED)
 
     t0 = time.time()
@@ -391,28 +453,28 @@ def run_animecolor(config: dict):
                 "sharp linework, consistent lighting"
             ),
             negative_prompt=(
-                "low quality, blurry, distortion, desaturated, dark, "
-                "grayscale, inconsistent colors, flickering, ghosting"
+                "The video is not of a high quality, it has a low resolution. "
+                "Watermark present in each frame. The background is solid. "
+                "Strange body and strange trajectory. Distortion."
             ),
             ref_image=ref_tensor,
             control_video=ctrl_tensor,
             height=HEIGHT,
             width=WIDTH,
-            num_frames=padded_frames,       # full sequence in one pass
+            num_frames=padded_frames,
             guidance_scale=GUIDANCE_SCALE,
             num_inference_steps=INFERENCE_STEPS,
             generator=generator,
             output_type="latent",
             return_dict=True,
-            id_cond=None,
-            id_vit_hidden=None,
+            id_cond=id_cond,
+            id_vit_hidden=id_vit_hidden,
         )
 
     elapsed = time.time() - t0
-    latent_cpu = output.videos.cpu()   # [B, F_lat, C, H, W]  (frames-first)
+    latent_cpu = output.videos.cpu()   # [B, F_lat, C, H, W]
     print(f"  Inference done in {elapsed/60:.1f} min. Latent: {latent_cpu.shape}")
 
-    pipe.dclip_model.to("cpu")
     del ctrl_tensor
     torch.cuda.empty_cache()
     gc.collect()
@@ -421,9 +483,7 @@ def run_animecolor(config: dict):
     time.sleep(INFER_REST)
 
     # ============================================================
-    # 11. REMOVE PIPELINE HOOKS, TAKE VAE OWNERSHIP
-    #     NOW (and only now) we remove accelerate hooks so we can
-    #     move the VAE freely for GPU decode.
+    # 12. REMOVE PIPELINE HOOKS, TAKE VAE OWNERSHIP
     # ============================================================
     print("\n[PHASE 4] Removing pipeline hooks, freeing VRAM...")
 
@@ -431,8 +491,6 @@ def run_animecolor(config: dict):
                 pipe.text_encoder, pipe.vae]:
         remove_hook_from_module(model, recurse=True)
         model.to("cpu")
-    if hasattr(pipe, "dclip_model"):
-        pipe.dclip_model.to("cpu")
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -441,12 +499,24 @@ def run_animecolor(config: dict):
     print(f"  Hooks removed. Free VRAM: {free_gb:.2f} GB")
 
     vae_standalone = pipe.vae
-    vae_standalone.enable_slicing()
-    vae_standalone.enable_tiling()
+
+    # Conditional slicing for decode phase only.
+    # On 8GB with all other models on CPU, ~5-6GB should be free.
+    # A 49-frame bf16 decode at 512x320 needs ~4-5GB.
+    # Enable slicing only if headroom is tight — it introduces temporal
+    # chunk boundaries which reduce consistency across the sequence.
+    # Tiling remains disabled always — spatial seams are worse than temporal ones.
+    free_gb_predecode = get_free_vram_gb()
+    if free_gb_predecode < 5.0:
+        vae_standalone.enable_slicing()
+        print(f"  VAE slicing ENABLED  (free VRAM: {free_gb_predecode:.2f} GB — tight)")
+    else:
+        print(f"  VAE slicing DISABLED (free VRAM: {free_gb_predecode:.2f} GB — sufficient)")
+
     scaling_factor = vae_standalone.config.scaling_factor
 
     # ============================================================
-    # 12. DECODE ON GPU
+    # 13. DECODE ON GPU
     #     Pipeline returns [B, F_lat, C, H, W]  (frames-first).
     #     VAE decode expects [B, C, F_lat, H, W] (channels-first).
     # ============================================================
@@ -470,25 +540,21 @@ def run_animecolor(config: dict):
     time.sleep(DECODE_REST)
 
     # ============================================================
-    # 13. SAVE FRAMES
-    #     Trim padding, save clean PNGs — NO colour post-processing.
-    #     We intentionally skip ImageEnhance here: the model already
-    #     has guidance_scale pushing it toward the reference colour;
-    #     post-processing boosts noise along with colour and was a
-    #     contributing factor to ghosting artefacts.
-    #     If the raw output is still too dull, raise GUIDANCE_SCALE
-    #     rather than adding post-processing.
+    # 14. SAVE FRAMES — NO POST-PROCESSING
+    #     Post-processing removed: brightness/saturation/contrast boosts
+    #     and UnsharpMask were confirmed to degrade color fidelity and
+    #     worsen temporal consistency by amplifying frame-to-frame variation.
+    #     If output is still too dull after HCE is confirmed working,
+    #     raise GUIDANCE_SCALE rather than adding post-processing.
     # ============================================================
     print("\n[PHASE 6] Saving frames to disk...")
 
-    # Clean out any leftover frames from a previous run
     for old in FRAMES_DIR.glob("frame_*.png"):
         old.unlink()
 
-    for i in range(actual_frames):   # trim padding here
+    for i in range(actual_frames):
         frame_np  = decoded_cpu[0, :, i].permute(1, 2, 0).numpy()
         frame_img = Image.fromarray((frame_np * 255).clip(0, 255).astype(np.uint8))
-        frame_img = post_process_frame(frame_img)
         frame_img.save(FRAMES_DIR / f"frame_{i:05d}.png")
 
     del decoded_cpu
@@ -497,7 +563,7 @@ def run_animecolor(config: dict):
     print(f"  Saved {actual_frames} frames to {FRAMES_DIR}")
 
     # ============================================================
-    # 14. COMPILE VIDEO
+    # 15. COMPILE VIDEO
     # ============================================================
     print(f"\n[PHASE 7] Compiling MP4  ({actual_frames} frames @ {OUTPUT_FPS} fps)...")
 
